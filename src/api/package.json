@@ -1,0 +1,31 @@
+{
+  "name": "@property-portfolio/api",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rimraf dist",
+    "prestart": "npm run clean && npm run build",
+    "start": "func start",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@azure/communication-email": "^1.1.0",
+    "@azure/cosmos": "^4.4.1",
+    "@azure/functions": "^4.11.0",
+    "@azure/identity": "^4.11.1",
+    "@azure/storage-blob": "^12.28.0",
+    "zod": "^4.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.16.5",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.11"
+  }
+}

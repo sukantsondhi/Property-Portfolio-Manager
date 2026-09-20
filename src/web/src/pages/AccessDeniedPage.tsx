@@ -1,0 +1,2 @@
+import { LockKeyhole } from "lucide-react";
+export function AccessDeniedPage() { return <main className="standalone"><div className="access-card"><span><LockKeyhole /></span><h1>Invitation required</h1><p>Property Portfolio Manager is currently a private, invitation-only platform. This Microsoft account has not been approved and no portfolio data has been shared with it.</p><a className="button primary" href="/.auth/logout?post_logout_redirect_uri=/login">Use another account</a></div></main>; }

@@ -1,0 +1,12 @@
+name: property-portfolio-manager
+metadata:
+  template: azd-init
+infra:
+  provider: bicep
+  path: ./infra
+services:
+  web:
+    project: ./src/web
+    language: js
+    host: staticwebapp
+    dist: dist

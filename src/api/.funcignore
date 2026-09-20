@@ -1,0 +1,6 @@
+local.settings.json
+local.settings.example.json
+test/
+src/
+tsconfig.json
+dist/**/*.map

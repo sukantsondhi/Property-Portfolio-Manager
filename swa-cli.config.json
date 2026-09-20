@@ -1,0 +1,14 @@
+{
+  "$schema": "https://aka.ms/azure/static-web-apps-cli/schema",
+  "configurations": {
+    "property-portfolio-manager": {
+      "appLocation": "src/web",
+      "apiLocation": "src/api",
+      "outputLocation": "dist",
+      "appBuildCommand": "npm run build",
+      "apiBuildCommand": "npm ci --workspaces=false && npm run build --workspaces=false",
+      "run": "npm run dev -- --host 127.0.0.1",
+      "appDevserverUrl": "http://127.0.0.1:5173"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "DefaultEndpointsProtocol=http;AccountName=localdev;AccountKey=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=;BlobEndpoint=http://127.0.0.1:10000/localdev;QueueEndpoint=http://127.0.0.1:10001/localdev;TableEndpoint=http://127.0.0.1:10002/localdev;",
+    "FUNCTIONS_WORKER_RUNTIME": "node",
+    "NODE_ENV": "development",
+    "DATA_BACKEND": "memory",
+    "LOCAL_AUTH": "true",
+    "PLATFORM_ADMIN_EMAILS": "developer@example.com",
+    "COMMUNICATION_SERVICES_CONNECTION_STRING": "endpoint=https://example.communication.azure.com/;accesskey=replace-me",
+    "REMINDER_SENDER_ADDRESS": "DoNotReply@example.azurecomm.net",
+    "DOCUMENT_UPLOADS_ENABLED": "true",
+    "STORAGE_ACCOUNT_NAME": "localdev",
+    "STORAGE_ACCOUNT_KEY": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+    "STORAGE_BLOB_ENDPOINT": "http://127.0.0.1:10000/localdev",
+    "STORAGE_CONTAINER": "documents",
+    "REMINDER_API_KEY": "replace-with-at-least-32-random-characters",
+    "WEB_URL": "http://localhost:5173"
+  }
+}

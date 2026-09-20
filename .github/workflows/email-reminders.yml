@@ -1,0 +1,30 @@
+name: Send email reminders
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: property-portfolio-email-reminders
+  cancel-in-progress: false
+
+jobs:
+  send:
+    if: ${{ vars.REMINDERS_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Run daily reminder check
+        env:
+          PORTFOLIO_URL: ${{ vars.PORTFOLIO_API_URL }}
+          REMINDER_API_KEY: ${{ secrets.REMINDER_API_KEY }}
+        run: |
+          test -n "$PORTFOLIO_URL"
+          test -n "$REMINDER_API_KEY"
+          curl --fail-with-body --retry 3 --request POST \
+            --header "x-reminder-key: $REMINDER_API_KEY" \
+            "$PORTFOLIO_URL/api/reminders/run"
