@@ -1,11 +1,113 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Container } from "@azure/cosmos";
 import type { AuthenticatedUser } from "../src/domain/types";
-import { DirectoryService, MemoryDirectoryBackend } from "../src/services/directory";
+import { CosmosDirectoryBackend, DirectoryService, MemoryDirectoryBackend } from "../src/services/directory";
 
 const user = (email: string): AuthenticatedUser => ({ userId: `id-${email}`, email, roles: ["authenticated"] });
 
 describe("multi-tenant directory", () => {
   afterEach(() => delete process.env.PLATFORM_ADMIN_EMAILS);
+  it("rejects an oversized access cleanup before deleting portfolio data", async () => {
+    process.env.PLATFORM_ADMIN_EMAILS = "admin@example.com";
+    const backend = new MemoryDirectoryBackend();
+    const directory = new DirectoryService(backend);
+    const admin = user("admin@example.com");
+    const organization = await directory.createOrganization("Large Portfolio", admin);
+    for (let index = 0; index < 100; index += 1)
+      await backend.put({ id: `member-${index}`, organizationId: "_platform", kind: "organizationMembership", targetOrganizationId: organization.id, platformUserId: `user-${index}`, role: "editor", status: "active", createdAt: "now", updatedAt: "now" });
+    const cleanup = vi.fn();
+    await expect(directory.deleteOrganization(organization.id, organization.name, admin, cleanup)).rejects.toMatchObject({ code: "directory_change_too_large" });
+    expect(cleanup).not.toHaveBeenCalled();
+    await expect(directory.authorize(admin, organization.id)).resolves.toMatchObject({ organizationRole: "owner" });
+  });
+  it("does not accept a legacy organisation invitation while deletion is pending", async () => {
+    process.env.PLATFORM_ADMIN_EMAILS = "admin@example.com";
+    const backend = new MemoryDirectoryBackend();
+    const directory = new DirectoryService(backend);
+    const admin = user("admin@example.com");
+    const member = user("member@example.com");
+    const organization = await directory.createOrganization("Private Portfolio", admin);
+    await directory.createPlatformInvitation(member.email, admin);
+    await directory.resolveUser(member);
+    await backend.put({ id: "legacy-invitation", organizationId: "_platform", kind: "organizationInvitation", targetOrganizationId: organization.id, email: member.email, role: "editor", status: "pending", expiresAt: "9999-12-31", createdAt: "now", updatedAt: "now" });
+    await directory.deleteOrganization(organization.id, organization.name, admin, async () => {
+      await directory.resolveUser(member);
+      expect((await backend.all()).filter((record) => record.kind === "organizationMembership" && record.role === "editor")).toHaveLength(0);
+      return { deletedRecordCount: 0, deletedBlobCount: 0, blobCleanupFailures: 0 };
+    });
+  });
+  it("commits directory changes with a partition-scoped guard and retries conflicts", async () => {
+    const batch = vi.fn()
+      .mockResolvedValueOnce({ result: [{ statusCode: 412 }, { statusCode: 424 }] })
+      .mockResolvedValueOnce({ result: [{ statusCode: 200 }, { statusCode: 201 }] });
+    const item = vi.fn(() => ({ read: async () => ({ resource: { _etag: "guard-version" } }) }));
+    const query = vi.fn(() => ({ fetchAll: async () => ({ resources: [] }) }));
+    const backend = new CosmosDirectoryBackend({ item, items: { query, batch } } as unknown as Container);
+    const action = vi.fn(async (snapshot: Parameters<Parameters<typeof backend.transaction>[0]>[0]) => snapshot.put({ id: "synthetic", organizationId: "_platform", kind: "auditEvent", createdAt: "now", updatedAt: "now" }));
+    await backend.transaction(action);
+    expect(action).toHaveBeenCalledTimes(2);
+    expect(item).toHaveBeenCalledWith("directory-write-guard", "_platform");
+    expect(batch).toHaveBeenLastCalledWith([
+      expect.objectContaining({ operationType: "Replace", id: "directory-write-guard", ifMatch: "guard-version" }),
+      expect.objectContaining({ operationType: "Create", id: "synthetic" }),
+    ], "_platform");
+  });
+  it("denies membership changes during organisation cleanup and permits a cleanup retry", async () => {
+    process.env.PLATFORM_ADMIN_EMAILS = "admin@example.com";
+    const directory = new DirectoryService(new MemoryDirectoryBackend());
+    const admin = user("admin@example.com");
+    const organization = await directory.createOrganization("Private Portfolio", admin);
+    await expect(directory.deleteOrganization(organization.id, organization.name, admin, async () => {
+      await expect(directory.authorize(admin, organization.id)).rejects.toMatchObject({ code: "organization_not_found" });
+      throw new Error("synthetic cleanup failure");
+    })).rejects.toThrow("synthetic cleanup failure");
+    await expect(directory.deleteOrganization(organization.id, organization.name, admin, async () => ({ deletedRecordCount: 0, deletedBlobCount: 0, blobCleanupFailures: 0 }))).resolves.toMatchObject({ id: organization.id });
+  });
+  it("accepts concurrent first sign-ins once and fully revokes the displayed account", async () => {
+    process.env.PLATFORM_ADMIN_EMAILS = "admin@example.com";
+    const backend = new MemoryDirectoryBackend();
+    const directory = new DirectoryService(backend);
+    const admin = user("admin@example.com");
+    const member = user("member@example.com");
+    await directory.resolveUser(admin);
+    await directory.createPlatformInvitation(member.email, admin);
+    await Promise.all([directory.resolveUser(member), directory.resolveUser(member)]);
+    expect((await backend.all()).filter((record) => record.kind === "platformUser" && record.providerUserId === member.userId)).toHaveLength(1);
+    const organization = await directory.createOrganization("Private Portfolio", admin);
+    await directory.inviteMember(organization.id, member.email, "editor", admin);
+    const displayed = (await directory.listPlatformInvitations(admin)).find((record) => record.email === member.email)!;
+    await directory.deactivatePlatformUser(displayed.id, admin);
+    await expect(directory.authorize(member, organization.id)).rejects.toMatchObject({ code: "invitation_required" });
+  });
+  it("revokes every legacy duplicate identity and its memberships", async () => {
+    process.env.PLATFORM_ADMIN_EMAILS = "admin@example.com";
+    const backend = new MemoryDirectoryBackend();
+    const directory = new DirectoryService(backend);
+    const admin = user("admin@example.com");
+    const member = user("member@example.com");
+    await directory.createPlatformInvitation(member.email, admin);
+    await directory.resolveUser(member);
+    const original = (await backend.all()).find((record) => record.kind === "platformUser" && record.email === member.email)!;
+    await backend.put({ ...original, id: "legacy-duplicate" });
+    const organization = await directory.createOrganization("Private Portfolio", admin);
+    await directory.inviteMember(organization.id, member.email, "editor", admin);
+    await directory.deactivatePlatformUser("legacy-duplicate", admin);
+    await expect(directory.authorize(member, organization.id)).rejects.toMatchObject({ code: "invitation_required" });
+  });
+  it("retains an owner when two owner removals race", async () => {
+    process.env.PLATFORM_ADMIN_EMAILS = "admin@example.com";
+    const directory = new DirectoryService(new MemoryDirectoryBackend());
+    const admin = user("admin@example.com");
+    const owner = user("owner@example.com");
+    await directory.createPlatformInvitation(owner.email, admin);
+    await directory.resolveUser(owner);
+    const organization = await directory.createOrganization("Private Portfolio", admin);
+    await directory.inviteMember(organization.id, owner.email, "owner", admin);
+    const { members } = await directory.listMembers(organization.id, admin);
+    const results = await Promise.allSettled(members.map((member) => directory.removeMembership(organization.id, member.id, admin)));
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect((await directory.listMembers(organization.id, admin)).members.filter((member) => member.role === "owner")).toHaveLength(1);
+  });
   it("admits only invited users and isolates organisation membership", async () => {
     process.env.PLATFORM_ADMIN_EMAILS = "admin@example.com";
     const directory = new DirectoryService(new MemoryDirectoryBackend());

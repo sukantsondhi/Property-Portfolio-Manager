@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { MemoryStore } from "../src/services/store";
-import type { AuthenticatedUser } from "../src/domain/types";
+import { describe, expect, it, vi } from "vitest";
+import type { Container } from "@azure/cosmos";
+import { CosmosStore, MemoryStore } from "../src/services/store";
+import type { AuthenticatedUser, PortfolioRecord } from "../src/domain/types";
 
 const user: AuthenticatedUser = {
   userId: "one",
@@ -9,6 +10,104 @@ const user: AuthenticatedUser = {
 };
 
 describe("record store", () => {
+  it("retains pending blob cleanup after metadata deletion and recognises a retry", async () => {
+    const store = new MemoryStore();
+    const property = await store.create("property", { name: "House" }, user);
+    await store.create("document", { propertyId: property.id, blobName: "org/test/evidence.pdf", size: 8 }, user);
+    const archived = await store.setArchived("property", property.id, true, user, property._etag);
+    const deleted = await store.permanentDelete("property", property.id, archived._etag);
+    expect(deleted.blobNames).toEqual(["org/test/evidence.pdf"]);
+    await expect(store.permanentDelete("property", property.id, archived._etag)).resolves.toMatchObject({ deletedCount: 0, blobNames: deleted.blobNames });
+    await store.acknowledgeBlobDeletion(deleted.blobNames[0]);
+    await expect(store.permanentDelete("property", property.id, archived._etag)).rejects.toMatchObject({ status: 404 });
+  });
+  it("does not delete a legacy blob still referenced by another document", async () => {
+    const store = new MemoryStore();
+    const property = await store.create("property", { name: "House" }, user);
+    const document = await store.create("document", { propertyId: property.id, blobName: "org/test/shared.pdf" }, user);
+    await store.create("document", { propertyId: property.id, blobName: "org/test/shared.pdf" }, user);
+    const archived = await store.setArchived("document", document.id, true, user, document._etag);
+    await expect(store.permanentDelete("document", document.id, archived._etag)).resolves.toMatchObject({ blobNames: [] });
+  });
+  it("rejects a delete when a record changes after the deletion snapshot", async () => {
+    const store = new MemoryStore();
+    const property = await store.create("property", { name: "House" }, user);
+    const archived = await store.setArchived("property", property.id, true, user, property._etag);
+    const allRecords = store.allRecords.bind(store);
+    vi.spyOn(store, "allRecords").mockImplementationOnce(async () => {
+      const records = await allRecords();
+      await store.setArchived("property", property.id, false, user, archived._etag);
+      return records;
+    });
+    await expect(store.permanentDelete("property", property.id, archived._etag)).rejects.toMatchObject({ code: "version_conflict" });
+    expect(await store.get("property", property.id)).toMatchObject({ archived: false });
+  });
+
+  it("keeps archived closed-year records read-only", async () => {
+    const store = new MemoryStore();
+    const property = await store.create("property", { name: "House" }, user);
+    const year = await store.create("rentalYear", { propertyId: property.id, status: "current" }, user);
+    const expense = await store.create("expense", { propertyId: property.id }, user);
+    const archived = await store.setArchived("expense", expense.id, true, user, expense._etag);
+    await store.update("rentalYear", year.id, { status: "closed" }, user, year._etag);
+    await expect(store.permanentDelete("expense", expense.id, archived._etag)).rejects.toMatchObject({ code: "historical_record" });
+  });
+
+  it("fences Cosmos cascades and sends a condition with every delete", async () => {
+    const root = { id: "property", kind: "property", organizationId: "org", archived: true, _etag: "root-etag" } as PortfolioRecord;
+    const child = { id: "document", kind: "document", organizationId: "org", propertyId: root.id, _etag: "child-etag" } as PortfolioRecord;
+    const batch = vi.fn().mockImplementation(async (operations: unknown[]) => ({ result: operations.map(() => ({ statusCode: 200 })) }));
+    const container = { item: (id: string) => ({ read: async () => ({ resource: id === root.id ? { ...root, deleting: true, _etag: "fenced-etag" } : undefined }) }), items: { batch } } as unknown as Container;
+    const store = new CosmosStore("org", container);
+    await store.remove([child, root], root, "");
+    expect(batch.mock.calls[0][0]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ resourceBody: expect.objectContaining({ deletingRoots: [root.id] }) }),
+      expect.objectContaining({ id: root.id, ifMatch: "root-etag", resourceBody: expect.objectContaining({ deleting: true }) }),
+    ]));
+    expect(batch.mock.calls[1][0]).toEqual([
+      expect.objectContaining({ operationType: "Delete", id: child.id, ifMatch: "child-etag" }),
+      expect.objectContaining({ operationType: "Delete", id: root.id, ifMatch: "fenced-etag" }),
+    ]);
+  });
+
+  it("blocks late writes to a deletion-fenced property", async () => {
+    const batch = vi.fn();
+    const guard = { id: "organization-mutation-guard", deletingRoots: ["property"], _etag: "guard-etag" };
+    const store = new CosmosStore("org", { item: () => ({ read: async () => ({ resource: guard }) }), items: { batch } } as unknown as Container);
+    await expect(store.put({ id: "expense", kind: "expense", propertyId: "property", organizationId: "org" } as PortfolioRecord)).rejects.toMatchObject({ code: "deletion_in_progress" });
+    expect(batch).not.toHaveBeenCalled();
+  });
+
+  it("rejects cross-year links and clearing an existing rental-year link", async () => {
+    const store = new MemoryStore();
+    const property = await store.create("property", { name: "House" }, user);
+    const oldYear = await store.create("rentalYear", { propertyId: property.id, status: "current" }, user);
+    const oldTenant = await store.create("tenant", { propertyId: property.id, firstName: "Old" }, user);
+    const oldDocument = await store.create("document", { propertyId: property.id }, user);
+    await store.update("rentalYear", oldYear.id, { status: "closed" }, user, oldYear._etag);
+    const current = await store.create("rentalYear", { propertyId: property.id, status: "current" }, user);
+    await expect(store.create("rentPayment", { propertyId: property.id, tenantId: oldTenant.id, rentalYearId: current.id, appliesToMonth: "2026-09" }, user)).rejects.toMatchObject({ code: "relationship_mismatch" });
+    await expect(store.create("tenancy", { propertyId: property.id, tenantIds: [oldTenant.id] }, user)).rejects.toMatchObject({ code: "relationship_mismatch" });
+    await expect(store.create("expense", { propertyId: property.id, documentId: oldDocument.id }, user)).rejects.toMatchObject({ code: "relationship_mismatch" });
+    const tenant = await store.create("tenant", { propertyId: property.id, firstName: "Current" }, user);
+    await expect(store.update("tenant", tenant.id, { rentalYearId: "" }, user, tenant._etag)).rejects.toMatchObject({ code: "immutable_relationship" });
+  });
+
+  it("conditionally checks the current year in the same Cosmos batch as its child write", async () => {
+    const year = { id: "year", kind: "rentalYear", status: "current", _etag: "year-etag" };
+    const child = { id: "child", kind: "expense", organizationId: "org", rentalYearId: "year", _etag: "child-etag" } as PortfolioRecord;
+    const batch = vi.fn().mockImplementation(async (operations: unknown[]) => ({ result: operations.map(() => ({ statusCode: 200 })) }));
+    const container = { item: (id: string) => ({ read: async () => ({ resource: id === "year" ? year : id === "child" ? child : undefined }) }), items: { batch } } as unknown as Container;
+    const store = new CosmosStore("org", container);
+    await store.put(child, "child-etag");
+    expect(batch).toHaveBeenCalledWith(expect.arrayContaining([
+      expect.objectContaining({ operationType: "Replace", id: "year", ifMatch: "year-etag" }),
+      expect.objectContaining({ operationType: "Replace", id: "child", ifMatch: "child-etag" }),
+    ]), "org");
+    batch.mockImplementation(async (operations: unknown[]) => ({ result: operations.map((_, index) => ({ statusCode: index === 1 ? 412 : 424 })) }));
+    await expect(store.put(child, "child-etag")).rejects.toMatchObject({ code: "version_conflict" });
+  });
+
   it("creates, updates, archives and restores a record", async () => {
     const store = new MemoryStore();
     const created = await store.create(

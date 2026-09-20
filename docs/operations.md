@@ -6,7 +6,7 @@
 - Review failed workflow notifications.
 - A successful run with `count: 0` is normal when nothing is due.
 
-Compliance reminders go to every active member of the organisation at the configured offsets and on the expiry date. Only the live compliance record (without `rentalYearId`) is scanned; rollover snapshots never send. Rent reminders go to the same active members on the configured collection day, every seventh day afterwards until settled, and once when all tenants are Paid, covered In advance, Waived or Adjusted. Per-recipient delivery hashes prevent a successful stage from being sent twice.
+Compliance reminders go to every active member of the organisation at the configured offsets and on the expiry date. Only the live compliance record (without `rentalYearId`) is scanned; rollover snapshots never send. Rent reminders go to the same active members on the configured collection day, every seventh day afterwards until settled, and once when all tenants are Paid, covered In advance, Waived or Adjusted. Atomic per-recipient claims prevent overlapping scheduler calls from sending the same stage concurrently. Unknown send outcomes require review rather than automatic retry.
 
 Templates and selection rules are server-side in `src/api/src/services/reminders.ts`. The authorised scheduler/deduplication handler is `src/api/src/functions/reminders.ts`. Do not move templates, recipients, credentials or delivery decisions into the browser.
 
@@ -38,6 +38,14 @@ The initial Storage alert fires above 5 GiB, an application business threshold r
 4. Query only delivery metadata; do not paste customer record contents into tickets.
 5. Correct the issue and run a controlled manual reminder.
 6. Record incident time, affected organisations, message count and remediation.
+
+`delivery_review_required` means an `uncertain` claim or a `sending` claim older than two minutes exists. Stop competing scheduler callers and inspect ACS delivery evidence privately before correcting the matching `_platform` delivery record with its ETag. Mark it `sent` only with positive delivery evidence, or `failed` only after confirming no delivery occurred. If the outcome cannot be established, leave it suppressed. Do not delete claims blindly; a crash after provider acceptance is not proof that no email was sent.
+
+## Pending cleanup
+
+Failed or abandoned uploads remain archived reservations until their blob cleanup succeeds. Owners can permanently delete them after the two-minute pending window; they cannot be restored as accepted documents. A pending upload blocks deletion of its property or organisation until it finishes or expires.
+
+Cascade deletion installs a fence before removing records, and every delete is conditional. A conflict returns an error rather than deleting a newly changed record. After a partial failure, do not remove the fence manually: retry the same owner-authorised deletion to finish its stored Blob cleanup list. A pending organisation deletion is unavailable to portfolio users and can be retried using its ID, exact name and an authorised owner/super-admin session. Preserve request IDs and cleanup counts, not documents or signed URLs, when escalating. No new background cleanup service is installed.
 
 ## Data recovery
 

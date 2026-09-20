@@ -2,6 +2,7 @@ import { EmailClient } from "@azure/communication-email";
 import type { PortfolioRecord } from "../domain/types";
 
 const MS_PER_DAY = 86_400_000;
+export class ReminderNotSentError extends Error {}
 export type DueReminder = { record: PortfolioRecord; propertyName: string; daysUntilExpiry: number; offsetDays: number };
 export type RentCollectionTenantStatus = {
   tenantId: string;
@@ -118,7 +119,7 @@ const escapeHtml = (value: unknown) => String(value).replace(/[&<>"']/g, (char) 
 export async function sendReminderEmail(recipient: string, organizationName: string, items: DueReminder[]) {
   const connectionString = process.env.COMMUNICATION_SERVICES_CONNECTION_STRING;
   const senderAddress = process.env.REMINDER_SENDER_ADDRESS;
-  if (!connectionString || !senderAddress) throw new Error("Email reminder settings are incomplete.");
+  if (!connectionString || !senderAddress) throw new ReminderNotSentError("Email reminder settings are incomplete.");
   const lines = items.map((item) => `${item.propertyName}: ${String(item.record.title)} is due ${String(item.record.expiryDate)} (${item.offsetDays} days)`);
   const rows = items.map((item) => `<tr><td>${escapeHtml(item.propertyName)}</td><td>${escapeHtml(item.record.title)}</td><td>${escapeHtml(item.record.expiryDate)}</td><td>${item.offsetDays} days</td></tr>`).join("");
   const client = new EmailClient(connectionString);
@@ -132,7 +133,8 @@ export async function sendReminderEmail(recipient: string, organizationName: str
     },
   });
   const result = await poller.pollUntilDone();
-  if (result.status !== "Succeeded") throw new Error("Azure Communication Services did not deliver the compliance reminder.");
+  if (result.status === "Failed" || result.status === "Canceled") throw new ReminderNotSentError("Azure Communication Services did not deliver the compliance reminder.");
+  if (result.status !== "Succeeded") throw new Error("Azure Communication Services returned an uncertain compliance reminder status.");
   return result;
 }
 
@@ -158,11 +160,12 @@ export function rentCollectionEmail(organizationName: string, item: RentCollecti
 export async function sendRentCollectionEmail(recipient: string, organizationName: string, item: RentCollectionReminder) {
   const connectionString = process.env.COMMUNICATION_SERVICES_CONNECTION_STRING;
   const senderAddress = process.env.REMINDER_SENDER_ADDRESS;
-  if (!connectionString || !senderAddress) throw new Error("Email reminder settings are incomplete.");
+  if (!connectionString || !senderAddress) throw new ReminderNotSentError("Email reminder settings are incomplete.");
   const content = rentCollectionEmail(organizationName, item);
   const client = new EmailClient(connectionString);
   const poller = await client.beginSend({ senderAddress, recipients: { to: [{ address: recipient }] }, content });
   const result = await poller.pollUntilDone();
-  if (result.status !== "Succeeded") throw new Error("Azure Communication Services did not deliver the rent reminder.");
+  if (result.status === "Failed" || result.status === "Canceled") throw new ReminderNotSentError("Azure Communication Services did not deliver the rent reminder.");
+  if (result.status !== "Succeeded") throw new Error("Azure Communication Services returned an uncertain rent reminder status.");
   return result;
 }

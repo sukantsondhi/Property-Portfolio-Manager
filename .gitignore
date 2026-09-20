@@ -11,6 +11,7 @@ local.settings.json
 .azure/*/.env
 .azure/deployment-plan.md
 .codex/
+LOCAL_SECURITY_FINDINGS.md
 .azure-cli-local/
 .screenshot-browser/
 .azurite/

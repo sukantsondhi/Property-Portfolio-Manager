@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 const apiBase = process.env.SMOKE_API_URL ?? "http://127.0.0.1:7071/api";
+if (!["127.0.0.1", "localhost", "[::1]"].includes(new URL(apiBase).hostname)) throw new Error("The smoke suite requires a loopback API URL.");
 const runId = `${Date.now()}`;
 const admin = "developer@localhost";
 const owner = `owner.${runId}@example.com`;
@@ -51,10 +52,9 @@ async function invitePlatform(email) {
 
 async function upload(user, organizationId, propertyId, fixture) {
   const metadata = { propertyId, category: fixture.category, fileName: fixture.fileName, mimeType: fixture.mimeType, size: fixture.content.length };
-  const grant = await api(user, "/documents/upload-url", { method: "POST", organizationId, body: metadata });
-  const uploaded = await fetch(grant.body.url, { method: "PUT", headers: { "x-ms-blob-type": "BlockBlob", "content-type": fixture.mimeType }, body: fixture.content });
-  check(`private blob upload ${fixture.fileName}`, uploaded.ok, `HTTP ${uploaded.status}`);
-  return api(user, "/documents/complete", { method: "POST", organizationId, body: { ...metadata, documentId: grant.body.documentId, blobName: grant.body.blobName }, statuses: fixture.invalid ? [400] : [201] });
+  const uploaded = await fetch(`${apiBase}/documents/upload`, { method: "POST", redirect: "error", headers: { "content-type": fixture.mimeType, "x-local-user": user, "x-organization-id": organizationId, "x-document-metadata": encodeURIComponent(JSON.stringify(metadata)) }, body: fixture.content });
+  check(`bounded private upload ${fixture.fileName}`, uploaded.status === (fixture.invalid ? 400 : 201), `HTTP ${uploaded.status}`);
+  return { status: uploaded.status, body: await uploaded.json(), headers: uploaded.headers };
 }
 
 async function main() {

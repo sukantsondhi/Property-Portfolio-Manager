@@ -63,7 +63,7 @@ app.http("startRentalYear", {
               attachments.push({
                 name: String(document.fileName || "document").replace(/[\\/\r\n]/g, "_"),
                 contentType: String(document.mimeType || "application/octet-stream"),
-                contentInBase64: await downloadBlobBase64(String(document.blobName)),
+                contentInBase64: await downloadBlobBase64(String(document.blobName), Math.min(size, 6 * 1024 * 1024 - attachedBytes)),
               });
               attachedBytes += size;
             } catch {

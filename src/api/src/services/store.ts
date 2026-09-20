@@ -10,10 +10,14 @@ import type {
   RecordKind,
   StartRentalYearInput,
 } from "../domain/types";
-import { getCredential } from "./credential";
+import { assertProductionConfiguration, getCredential } from "./credential";
 import { StoreError } from "./responses";
 
 export interface RecordStore {
+  acknowledgeBlobDeletion(blobName: string): Promise<void>;
+  reserveDocumentUpload(id: string, data: Record<string, unknown>, user: AuthenticatedUser): Promise<PortfolioRecord>;
+  completeDocumentUpload(reservation: PortfolioRecord, user: AuthenticatedUser): Promise<PortfolioRecord>;
+  abandonDocumentUpload(reservation: PortfolioRecord, user: AuthenticatedUser, deleteBlob: (name: string) => Promise<unknown>): Promise<void>;
   list(kind: RecordKind, options?: ListOptions): Promise<PortfolioRecord[]>;
   listPage(
     kind: RecordKind,
@@ -96,6 +100,18 @@ const yearScopedKinds = new Set<RecordKind>([
   "expense",
   "document",
 ]);
+
+const mutationGuardId = "organization-mutation-guard";
+export const maxOrganizationDocumentBytes = 5 * 1024 * 1024 * 1024;
+const maxOrganizationDocuments = 5000;
+const maxPendingUploads = 3;
+type PendingBlobDeletion = { documentId: string; rootId: string; rootKind: RecordKind | "organization"; blobName: string; size: number };
+type MutationGuard = { id: string; organizationId: string; kind: "mutationGuard"; archived: true; deletingRoots: string[]; purging: boolean; revision: string; pendingBlobDeletes?: PendingBlobDeletion[]; _etag?: string };
+const deletionReferences = (record: PortfolioRecord, tenant?: PortfolioRecord) => [record.id, record.propertyId, record.tenantId, record.tenancyId, record.rentalYearId, tenant?.propertyId, ...(Array.isArray(record.tenantIds) ? record.tenantIds : [])].map(String);
+const conditionalDelete = (record: Pick<PortfolioRecord, "id" | "_etag">): OperationInput & { ifMatch: string } => {
+  if (!record._etag) throw new StoreError(409, "version_conflict", "Refresh the record before deleting it.");
+  return { operationType: BulkOperationType.Delete, id: record.id, ifMatch: record._etag };
+};
 
 function previousDay(isoDate: string) {
   const value = new Date(`${isoDate}T00:00:00.000Z`);
@@ -198,7 +214,53 @@ abstract class BaseStore implements RecordStore {
   abstract put(
     record: PortfolioRecord,
     etag?: string,
+    mutationVersion?: string,
   ): Promise<PortfolioRecord>;
+  protected abstract mutationVersion(): Promise<string>;
+  protected abstract pendingBlobDeletes(): Promise<PendingBlobDeletion[]>;
+  abstract acknowledgeBlobDeletion(blobName: string): Promise<void>;
+  protected abstract saveUploadCleanup(record: PortfolioRecord, etag: string): Promise<PortfolioRecord>;
+  protected abstract removeUpload(record: PortfolioRecord): Promise<void>;
+  async reserveDocumentUpload(id: string, data: Record<string, unknown>, user: AuthenticatedUser) {
+    const mutationVersion = await this.mutationVersion();
+    const documents = (await this.allRecords()).filter((record) => record.kind === "document");
+    const size = Number(data.size);
+    if (!Number.isInteger(size) || size < 1 || size > 25 * 1024 * 1024)
+      throw new StoreError(400, "invalid_upload", "Use a file of at most 25 MiB.");
+    const pendingDeletes = (await this.pendingBlobDeletes()).filter((entry) => !documents.some((record) => record.id === entry.documentId));
+    const usedBytes = documents.reduce((sum, record) => sum + (Number.isSafeInteger(record.size) && Number(record.size) > 0 ? Number(record.size) : 25 * 1024 * 1024), 0) + pendingDeletes.reduce((sum, entry) => sum + entry.size, 0);
+    if (documents.length >= maxOrganizationDocuments || usedBytes + size > maxOrganizationDocumentBytes)
+      throw new StoreError(409, "document_quota", "This organisation has reached its document storage limit. Ask an owner to remove unneeded documents.");
+    if (documents.filter((record) => record.uploadState && record.uploadOwnerId === user.userId).length >= maxPendingUploads)
+      throw new StoreError(429, "upload_limit", "Too many uploads are pending. Wait for them to finish or ask an owner to clear failed uploads from Archive.");
+    const prepared = { ...data };
+    if (!prepared.rentalYearId && prepared.propertyId) {
+      const year = (await this.list("rentalYear", { propertyId: String(prepared.propertyId), limit: 200 })).find((record) => record.status === "current");
+      if (year) prepared.rentalYearId = year.id;
+    }
+    await this.assertWritableRentalYear(prepared);
+    await this.assertRelationships("document", prepared);
+    const now = new Date().toISOString();
+    return this.put({ ...prepared, id, organizationId: this.organizationId, kind: "document", archived: true, uploadState: "pending", uploadOwnerId: user.userId, uploadExpiresAt: new Date(Date.now() + 120_000).toISOString(), createdAt: now, updatedAt: now, createdBy: user.email, updatedBy: user.email, version: 1 }, undefined, mutationVersion);
+  }
+  async completeDocumentUpload(reservation: PortfolioRecord, user: AuthenticatedUser) {
+    const current = await this.get("document", reservation.id);
+    if (current.uploadState !== "pending" || current.uploadOwnerId !== user.userId || current._etag !== reservation._etag || String(current.uploadExpiresAt) <= new Date().toISOString())
+      throw new StoreError(409, "upload_conflict", "This upload is no longer pending. Upload the file again.");
+    await this.assertWritableRentalYear(current);
+    await this.assertRelationships("document", current);
+    const { uploadState: _state, uploadOwnerId: _owner, uploadExpiresAt: _expires, ...record } = current;
+    return this.put({ ...record, archived: false, version: current.version + 1, updatedAt: new Date().toISOString(), updatedBy: user.email }, current._etag);
+  }
+  async abandonDocumentUpload(reservation: PortfolioRecord, user: AuthenticatedUser, deleteBlob: (name: string) => Promise<unknown>) {
+    let current: PortfolioRecord;
+    try { current = await this.get("document", reservation.id); }
+    catch (error) { if (error instanceof StoreError && error.status === 404) return; throw error; }
+    if (!current.uploadState || current.uploadOwnerId !== user.userId || !current._etag) return;
+    const failed = await this.saveUploadCleanup({ ...current, uploadState: "failed", version: current.version + 1, updatedAt: new Date().toISOString() }, current._etag);
+    await deleteBlob(String(failed.blobName));
+    await this.removeUpload(failed);
+  }
   protected async putHistoricalSnapshot(record: PortfolioRecord) {
     return this.put(record);
   }
@@ -250,10 +312,10 @@ abstract class BaseStore implements RecordStore {
   ) {
     return this.put(candidate, etag);
   }
-  abstract remove(records: PortfolioRecord[]): Promise<void>;
+  abstract remove(records: PortfolioRecord[], root?: PortfolioRecord, mutationVersion?: string, blobs?: PendingBlobDeletion[]): Promise<void>;
   private async requireActive(kind: RecordKind, id: string, label: string) {
     const record = await this.get(kind, id);
-    if (record.archived)
+    if (record.archived || record.deleting || record.uploadState)
       throw new StoreError(
         409,
         "parent_archived",
@@ -265,6 +327,10 @@ abstract class BaseStore implements RecordStore {
     kind: RecordKind,
     data: Record<string, unknown>,
   ) {
+    const assertSameYear = (linked: PortfolioRecord) => {
+      if (linked.rentalYearId && linked.rentalYearId !== data.rentalYearId)
+        throw new StoreError(409, "relationship_mismatch", "Linked records must belong to the same rental year.");
+    };
     const propertyId = String(data.propertyId ?? "");
     if (kind !== "property" && propertyId)
       await this.requireActive("property", propertyId, "property");
@@ -273,6 +339,7 @@ abstract class BaseStore implements RecordStore {
     let tenant: PortfolioRecord | undefined;
     if (tenantId) {
       tenant = await this.requireActive("tenant", tenantId, "tenant");
+      assertSameYear(tenant);
       if (propertyId && tenant.propertyId !== propertyId)
         throw new StoreError(
           409,
@@ -288,6 +355,7 @@ abstract class BaseStore implements RecordStore {
           String(linkedTenantId),
           "tenant",
         );
+        assertSameYear(linkedTenant);
         if (propertyId && linkedTenant.propertyId !== propertyId)
           throw new StoreError(
             409,
@@ -304,6 +372,7 @@ abstract class BaseStore implements RecordStore {
         tenancyId,
         "tenancy",
       );
+      assertSameYear(tenancy);
       if (propertyId && tenancy.propertyId !== propertyId)
         throw new StoreError(
           409,
@@ -348,6 +417,7 @@ abstract class BaseStore implements RecordStore {
         documentId,
         "document",
       );
+      if (kind !== "property") assertSameYear(document);
       const documentPropertyId = kind === "property" ? String(data.id ?? "") : propertyId;
       if (documentPropertyId && document.propertyId !== documentPropertyId)
         throw new StoreError(
@@ -483,7 +553,6 @@ abstract class BaseStore implements RecordStore {
     const tenancy = input.tenancyId
       ? await this.requireActive("tenancy", input.tenancyId, "tenancy")
       : undefined;
-    await this.assertRelationships("rentPayment", input as unknown as Record<string, unknown>);
     const monthlyRentPence = Number(tenant.monthlyRentPence || 0);
     if (!Number.isInteger(monthlyRentPence) || monthlyRentPence <= 0)
       throw new StoreError(
@@ -500,6 +569,7 @@ abstract class BaseStore implements RecordStore {
       throw new StoreError(404, "rental_year_not_found", "The selected rental year was not found for this property.");
     if (targetYear?.status === "closed")
       throw new StoreError(409, "historical_record", "Closed rental-year records are read-only. Restore the year before recording rent.");
+    await this.assertRelationships("rentPayment", { ...input, rentalYearId: targetYear?.id ?? "" });
     if (targetYear) {
       if (tenant.rentalYearId !== targetYear.id)
         throw new StoreError(
@@ -649,6 +719,7 @@ abstract class BaseStore implements RecordStore {
     etag?: string,
   ) {
     const current = await this.get(kind, id);
+    if (current.deleting || current.uploadState) throw new StoreError(409, "managed_record", "This record is being processed and cannot be edited.");
     if (current.archived)
       throw new StoreError(
         409,
@@ -690,6 +761,8 @@ abstract class BaseStore implements RecordStore {
       updatedBy: user.email,
       version: current.version + 1,
     };
+    if (kind !== "rentalYear" && current.rentalYearId && candidate.rentalYearId !== current.rentalYearId)
+      throw new StoreError(409, "immutable_relationship", "A record cannot be moved out of its rental year.");
     if (kind !== "rentalYear") await this.assertWritableRentalYear(candidate);
     await this.assertRelationships(kind, candidate);
     if (kind === "rentPayment") {
@@ -750,6 +823,7 @@ abstract class BaseStore implements RecordStore {
     etag?: string,
   ) {
     const current = await this.get(kind, id);
+    if (current.deleting || current.uploadState) throw new StoreError(409, "managed_record", "This record is being processed and cannot be restored or archived.");
     if (kind !== "rentalYear" && current.rentalYearId) {
       const year = await this.get("rentalYear", String(current.rentalYearId));
       if (year.status === "closed")
@@ -830,7 +904,16 @@ abstract class BaseStore implements RecordStore {
       );
   }
   async permanentDelete(kind: RecordKind, id: string, etag?: string) {
-    const current = await this.get(kind, id);
+    const mutationVersion = await this.mutationVersion();
+    let current: PortfolioRecord;
+    try { current = await this.get(kind, id); }
+    catch (error) {
+      if (!(error instanceof StoreError) || error.status !== 404) throw error;
+      const pending = (await this.pendingBlobDeletes()).filter((entry) => entry.rootId === id && entry.rootKind === kind);
+      if (!pending.length) throw error;
+      return { deletedCount: 0, blobNames: [...new Set(pending.map((entry) => entry.blobName))] };
+    }
+    if (current.rentalYearId && !current.uploadState) await this.assertWritableRentalYear(current);
     if (kind === "rentPayment" && isAdvanceManaged(current))
       throw new StoreError(
         405,
@@ -886,25 +969,28 @@ abstract class BaseStore implements RecordStore {
       }
     }
     const selected = records.filter((record) => ids.has(record.id));
+    if (selected.some((record) => record.uploadState === "pending" && String(record.uploadExpiresAt) > new Date().toISOString()))
+      throw new StoreError(409, "upload_in_progress", "Wait for active uploads to finish before permanently deleting these records.");
+    const blobs = selected.filter((record) => record.kind === "document" && record.blobName && !records.some((other) => !ids.has(other.id) && other.kind === "document" && other.blobName === record.blobName)).map((record) => ({ documentId: record.id, rootId: current.id, rootKind: current.kind, blobName: String(record.blobName), size: Number(record.size) || 25 * 1024 * 1024 }));
     await this.remove([
       ...selected.filter((record) => record.id !== current.id),
       current,
-    ]);
+    ], current, mutationVersion, blobs);
     return {
       deletedCount: selected.length,
-      blobNames: selected
-        .filter((record) => record.kind === "document" && record.blobName)
-        .map((record) => String(record.blobName)),
+      blobNames: [...new Set((await this.pendingBlobDeletes()).filter((entry) => entry.rootId === current.id && entry.rootKind === current.kind).map((entry) => entry.blobName))],
     };
   }
   async purgeAll() {
+    const mutationVersion = await this.mutationVersion();
     const records = await this.allRecords();
-    await this.remove(records);
+    if (records.some((record) => record.uploadState === "pending" && String(record.uploadExpiresAt) > new Date().toISOString()))
+      throw new StoreError(409, "upload_in_progress", "Wait for active uploads to finish, then retry organisation deletion.");
+    const blobs = records.filter((record) => record.kind === "document" && record.blobName).map((record): PendingBlobDeletion => ({ documentId: record.id, rootId: this.organizationId, rootKind: "organization", blobName: String(record.blobName), size: Number(record.size) || 25 * 1024 * 1024 }));
+    await this.remove(records, undefined, mutationVersion, blobs);
     return {
       deletedCount: records.length,
-      blobNames: records
-        .filter((record) => record.kind === "document" && record.blobName)
-        .map((record) => String(record.blobName)),
+      blobNames: [...new Set((await this.pendingBlobDeletes()).map((entry) => entry.blobName))],
     };
   }
   async startRentalYear(
@@ -999,7 +1085,7 @@ abstract class BaseStore implements RecordStore {
           propertySnapshot,
         },
         user,
-        current._etag,
+        (await this.get("rentalYear", current.id))._etag,
       );
     } else {
       const active = await this.allActive();
@@ -1054,7 +1140,7 @@ abstract class BaseStore implements RecordStore {
           legacyYear.id,
           { status: "closed" },
           user,
-          legacyYear._etag,
+          (await this.get("rentalYear", legacyYear.id))._etag,
         );
       }
     }
@@ -1221,6 +1307,31 @@ function withoutOrphans(records: PortfolioRecord[]) {
 export class MemoryStore extends BaseStore {
   private records = new Map<string, PortfolioRecord>();
   private restoredYears = new Map<string, string>();
+  private revision = 0;
+  private deletingRoots = new Set<string>();
+  private purging = false;
+  private blobDeletes = new Map<string, PendingBlobDeletion>();
+  protected async mutationVersion() { return String(this.revision); }
+  protected async pendingBlobDeletes() { return [...this.blobDeletes.values()]; }
+  async acknowledgeBlobDeletion(blobName: string) {
+    for (const [id, entry] of this.blobDeletes) if (entry.blobName === blobName) this.blobDeletes.delete(id);
+    this.revision += 1;
+  }
+  protected async saveUploadCleanup(record: PortfolioRecord, etag: string) {
+    if (this.records.get(record.id)?._etag !== etag) throw new StoreError(409, "upload_conflict", "The upload changed during cleanup.");
+    return this.putHistoricalSnapshot(record);
+  }
+  protected async removeUpload(record: PortfolioRecord) {
+    if (this.records.get(record.id)?._etag !== record._etag) throw new StoreError(409, "upload_conflict", "The upload changed during cleanup.");
+    this.records.delete(record.id);
+    this.revision += 1;
+  }
+  private assertMutation(record: PortfolioRecord, version?: string) {
+    if (version !== undefined && version !== String(this.revision)) throw new StoreError(409, "version_conflict", "Records changed during this request. Refresh and try again.");
+    const tenant = record.tenantId ? this.records.get(String(record.tenantId)) : undefined;
+    if (this.purging || deletionReferences(record, tenant).some((id) => this.deletingRoots.has(id)))
+      throw new StoreError(409, "deletion_in_progress", "These records are being permanently deleted.");
+  }
   async list(kind: RecordKind, options: ListOptions = {}) {
     const search = options.search?.toLowerCase();
     return [...this.records.values()]
@@ -1273,7 +1384,8 @@ export class MemoryStore extends BaseStore {
       throw new StoreError(404, "not_found", "Record not found.");
     return found;
   }
-  async put(record: PortfolioRecord, etag?: string) {
+  async put(record: PortfolioRecord, etag?: string, mutationVersion?: string) {
+    this.assertMutation(record, mutationVersion);
     const current = this.records.get(record.id);
     if (etag && current?._etag !== etag)
       throw new StoreError(
@@ -1288,15 +1400,19 @@ export class MemoryStore extends BaseStore {
     }
     const saved = { ...record, _etag: `W/\"${record.version}\"` };
     this.records.set(saved.id, saved);
+    this.revision += 1;
     return saved;
   }
   protected override async putHistoricalSnapshot(record: PortfolioRecord) {
+    this.assertMutation(record);
     const saved = { ...record, _etag: `W/\"${record.version}\"` };
     this.records.set(saved.id, saved);
+    this.revision += 1;
     return saved;
   }
   protected async putMany(records: PortfolioRecord[]) {
     for (const record of records) {
+      this.assertMutation(record);
       if (!record.rentalYearId) continue;
       const year = this.records.get(String(record.rentalYearId));
       if (year?.status === "closed")
@@ -1304,6 +1420,7 @@ export class MemoryStore extends BaseStore {
     }
     const saved = records.map((record) => ({ ...record, _etag: `W/\"${record.version}\"` }));
     for (const record of saved) this.records.set(record.id, record);
+    this.revision += 1;
     return saved;
   }
   protected override async saveRentalYearRestoration(
@@ -1347,15 +1464,24 @@ export class MemoryStore extends BaseStore {
     this.restoredYears.set(propertyId, current.id);
     return this.put(candidate, etag);
   }
-  async remove(records: PortfolioRecord[]) {
+  async remove(records: PortfolioRecord[], root?: PortfolioRecord, mutationVersion?: string, blobs: PendingBlobDeletion[] = []) {
+    if (mutationVersion !== undefined && mutationVersion !== String(this.revision))
+      throw new StoreError(409, "version_conflict", "Records changed during deletion. Refresh and try again.");
+    if (records.some((record) => record._etag !== this.records.get(record.id)?._etag))
+      throw new StoreError(409, "version_conflict", "A record changed during deletion. Refresh and try again.");
+    if (root) this.deletingRoots.add(root.id);
+    else this.purging = true;
+    for (const entry of blobs) this.blobDeletes.set(entry.documentId, entry);
     for (const record of records) this.records.delete(record.id);
+    this.revision += 1;
   }
 }
 
-class CosmosStore extends BaseStore {
+export class CosmosStore extends BaseStore {
   private container: Container;
-  constructor(organizationId: string) {
+  constructor(organizationId: string, container?: Container) {
     super(organizationId);
+    if (container) { this.container = container; return; }
     const endpoint = process.env.COSMOS_ENDPOINT;
     if (!endpoint) throw new Error("COSMOS_ENDPOINT is required.");
     const key = process.env.COSMOS_KEY;
@@ -1365,6 +1491,57 @@ class CosmosStore extends BaseStore {
     this.container = client
       .database(process.env.COSMOS_DATABASE ?? "portfolio")
       .container(process.env.COSMOS_CONTAINER ?? "records");
+  }
+  private async getMutationGuard(): Promise<MutationGuard | undefined> {
+    try { return (await this.container.item(mutationGuardId, this.organizationId).read<MutationGuard>()).resource; }
+    catch (error: any) { if (error.code === 404) return undefined; throw error; }
+  }
+  protected async mutationVersion() { return (await this.getMutationGuard())?._etag ?? ""; }
+  protected async pendingBlobDeletes() { return (await this.getMutationGuard())?.pendingBlobDeletes ?? []; }
+  async acknowledgeBlobDeletion(blobName: string) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const guard = await this.getMutationGuard();
+      if (!guard?.pendingBlobDeletes?.some((entry) => entry.blobName === blobName)) return;
+      try {
+        await this.runTransactionalBatch([this.guardOperation(guard, { pendingBlobDeletes: guard.pendingBlobDeletes.filter((entry) => entry.blobName !== blobName) })], async () => { throw new StoreError(409, "version_conflict", "Cleanup metadata changed."); });
+        return;
+      } catch (error) { if (!(error instanceof StoreError) || error.code !== "version_conflict") throw error; }
+    }
+    throw new StoreError(409, "version_conflict", "Retry deletion to finish the cleanup metadata update.");
+  }
+  protected async saveUploadCleanup(record: PortfolioRecord, etag: string) {
+    await this.runTransactionalBatch([
+      ...await this.mutationOperations([record]),
+      { operationType: BulkOperationType.Replace, id: record.id, resourceBody: record as any, ifMatch: etag },
+    ], async () => { throw new StoreError(409, "upload_conflict", "The upload changed during cleanup."); });
+    return this.get("document", record.id);
+  }
+  protected async removeUpload(record: PortfolioRecord) {
+    await this.runTransactionalBatch([
+      ...await this.mutationOperations([record]),
+      conditionalDelete(record),
+    ], async () => { throw new StoreError(409, "upload_conflict", "The upload changed during cleanup."); });
+  }
+  private guardOperation(guard?: MutationGuard, changes: Partial<MutationGuard> = {}): OperationInput {
+    return {
+      operationType: guard ? BulkOperationType.Replace : BulkOperationType.Create,
+      id: mutationGuardId,
+      resourceBody: { id: mutationGuardId, organizationId: this.organizationId, kind: "mutationGuard", archived: true, deletingRoots: [], purging: false, ...guard, ...changes, revision: randomUUID() },
+      ...(guard?._etag ? { ifMatch: guard._etag } : {}),
+    } as OperationInput;
+  }
+  private async mutationOperations(records: PortfolioRecord[], expectedVersion?: string) {
+    const guard = await this.getMutationGuard();
+    if (expectedVersion !== undefined && expectedVersion !== (guard?._etag ?? ""))
+      throw new StoreError(409, "version_conflict", "Records changed during this request. Refresh and try again.");
+    if (guard?.purging) throw new StoreError(409, "deletion_in_progress", "This organisation is being permanently deleted.");
+    const deleting = new Set(guard?.deletingRoots ?? []);
+    for (const record of records) {
+      const tenant = record.tenantId && !record.propertyId ? await this.get("tenant", String(record.tenantId)) : undefined;
+      if (deletionReferences(record, tenant).some((id) => deleting.has(id)))
+        throw new StoreError(409, "deletion_in_progress", "These records are being permanently deleted.");
+    }
+    return [this.guardOperation(guard)];
   }
   private buildRentPaymentGuard(record: PortfolioRecord): RentPaymentMonthGuard {
     const timestamp = String(record.updatedAt || record.createdAt || new Date().toISOString());
@@ -1431,6 +1608,7 @@ class CosmosStore extends BaseStore {
       }
       await this.runTransactionalBatch(
         [
+          ...await this.mutationOperations([year]),
           {
             operationType: BulkOperationType.Create,
             resourceBody: this.buildRentalYearLifecycleGuard(year) as any,
@@ -1451,17 +1629,22 @@ class CosmosStore extends BaseStore {
         guard: (await this.getRentalYearLifecycleGuard(propertyId))!,
       };
     }
-    private async lifecycleGuardOperations(records: PortfolioRecord[]) {
+    private async lifecycleGuardOperations(records: PortfolioRecord[], expectedVersion?: string) {
       const yearIds = [...new Set(records.map((record) => String(record.rentalYearId || "")).filter(Boolean))];
-      if (!yearIds.length) return [];
+      if (!yearIds.length) return this.mutationOperations(records, expectedVersion);
       if (yearIds.length !== 1)
         throw new StoreError(409, "relationship_mismatch", "A single operation cannot change records from different rental years.");
       const year = await this.get("rentalYear", yearIds[0]!);
       if (year.status === "closed")
         throw new StoreError(409, "historical_record", "Closed rental-year records are read-only.");
-      if (year.status !== "restored") return [];
+      if (year.status !== "restored") return [...await this.mutationOperations(records, expectedVersion), {
+        operationType: BulkOperationType.Replace,
+        id: year.id,
+        resourceBody: year as any,
+        ifMatch: year._etag,
+      } satisfies OperationInput];
       const { guard } = await this.ensureRentalYearLifecycleGuard(year);
-      return [{
+      return [...await this.mutationOperations(records, expectedVersion), {
         operationType: BulkOperationType.Replace,
         id: guard.id,
         resourceBody: {
@@ -1476,8 +1659,9 @@ class CosmosStore extends BaseStore {
       records: PortfolioRecord[],
       operations: OperationInput[],
       onConflict: () => Promise<never>,
+      expectedVersion?: string,
     ) {
-      const lifecycleOperations = await this.lifecycleGuardOperations(records);
+      const lifecycleOperations = await this.lifecycleGuardOperations(records, expectedVersion);
       await this.runTransactionalBatch([...lifecycleOperations, ...operations], onConflict);
     }
   private async runTransactionalBatch(
@@ -1485,18 +1669,21 @@ class CosmosStore extends BaseStore {
     onConflict: () => Promise<never>,
   ) {
     try {
+      if (operations.length > 100) throw new StoreError(409, "batch_too_large", "This operation exceeds the atomic write limit.");
       const response = await this.container.items.batch(operations, this.organizationId);
+      if (!response.result || response.result.length !== operations.length)
+        throw new StoreError(503, "incomplete_batch", "The write result could not be verified. Refresh before retrying.");
       const failed = response.result?.find(
         (result: any) => result.statusCode < 200 || result.statusCode >= 300,
       );
       if (!failed) return;
-      if (failed.statusCode === 412)
+      if (response.result.some((result) => result.statusCode === 412))
         throw new StoreError(
           409,
           "version_conflict",
           "This record changed since it was opened.",
         );
-      if (failed.statusCode === 409) await onConflict();
+      if (response.result.some((result) => result.statusCode === 409)) await onConflict();
       throw new StoreError(
         500,
         "rent_payment_batch_failed",
@@ -1716,6 +1903,7 @@ class CosmosStore extends BaseStore {
   ) {
     await this.runTransactionalBatch(
       [
+        ...await this.mutationOperations([candidate]),
         {
           operationType: BulkOperationType.Create,
           resourceBody: this.buildRentalYearLifecycleGuard(candidate) as any,
@@ -1744,6 +1932,7 @@ class CosmosStore extends BaseStore {
     const { year, guard } = await this.ensureRentalYearLifecycleGuard(current);
     await this.runTransactionalBatch(
       [
+        ...await this.mutationOperations([candidate]),
         {
           operationType: BulkOperationType.Replace,
           id: candidate.id,
@@ -1770,6 +1959,7 @@ class CosmosStore extends BaseStore {
     const { year, guard } = await this.ensureRentalYearLifecycleGuard(current);
     await this.runTransactionalBatch(
       [
+        ...await this.mutationOperations([candidate]),
         {
           operationType: BulkOperationType.Replace,
           id: guard.id,
@@ -1911,7 +2101,7 @@ class CosmosStore extends BaseStore {
         { partitionKey: this.organizationId },
       )
       .fetchAll();
-    return resources;
+    return resources.filter((record) => record.id !== mutationGuardId);
   }
   async get(kind: RecordKind, id: string) {
     try {
@@ -1927,30 +2117,16 @@ class CosmosStore extends BaseStore {
       throw error;
     }
   }
-  async put(record: PortfolioRecord, etag?: string) {
+  async put(record: PortfolioRecord, etag?: string, mutationVersion?: string) {
     try {
       if (!this.container) throw new Error("Container unavailable");
-      if (record.rentalYearId) {
-        await this.runLifecycleGuardedBatch(
-          [record],
-          [{
-            operationType: etag ? BulkOperationType.Replace : BulkOperationType.Upsert,
-            id: record.id,
-            resourceBody: record as any,
-            ...(etag ? { ifMatch: etag } : {}),
-          } satisfies OperationInput],
-          async () => {
-            throw new StoreError(409, "version_conflict", "This record changed since it was opened.");
-          },
-        );
-        return this.get(record.kind, record.id);
-      }
-      const response = etag
-        ? await this.container.item(record.id, this.organizationId).replace(record, {
-            accessCondition: { type: "IfMatch", condition: etag },
-          })
-        : await this.container.items.upsert(record);
-      return response.resource as PortfolioRecord;
+      await this.runLifecycleGuardedBatch(
+        [record],
+        [{ operationType: etag ? BulkOperationType.Replace : BulkOperationType.Create, id: record.id, resourceBody: record as any, ...(etag ? { ifMatch: etag } : {}) } satisfies OperationInput],
+        async () => { throw new StoreError(409, "version_conflict", "This record changed since it was opened."); },
+        mutationVersion,
+      );
+      return this.get(record.kind, record.id);
     } catch (error: any) {
       if (error.code === 412)
         throw new StoreError(
@@ -1963,8 +2139,11 @@ class CosmosStore extends BaseStore {
   }
   protected override async putHistoricalSnapshot(record: PortfolioRecord) {
     if (!this.container) throw new Error("Container unavailable");
-    const response = await this.container.items.create(record);
-    return response.resource as PortfolioRecord;
+    await this.runTransactionalBatch([
+      ...await this.mutationOperations([record]),
+      { operationType: BulkOperationType.Create, resourceBody: record as any },
+    ], async () => { throw new StoreError(409, "version_conflict", "Records changed during rollover. Refresh and try again."); });
+    return this.get(record.kind, record.id);
   }
   protected async putMany(records: PortfolioRecord[]) {
     const operations: OperationInput[] = records.map((record) => ({
@@ -1992,21 +2171,28 @@ class CosmosStore extends BaseStore {
       throw error;
     }
   }
-  async remove(records: PortfolioRecord[]) {
-    for (let index = 0; index < records.length; index += 25) {
-      await Promise.all(records.slice(index, index + 25).map(async (record) => {
-        try {
-          await this.container.item(record.id, this.organizationId).delete();
-        } catch (error: any) {
-          if (error.code !== 404) throw error;
-        }
-      }));
+  async remove(records: PortfolioRecord[], root?: PortfolioRecord, mutationVersion?: string, blobs: PendingBlobDeletion[] = []) {
+    const guard = await this.getMutationGuard();
+    if (mutationVersion !== undefined && mutationVersion !== (guard?._etag ?? ""))
+      throw new StoreError(409, "version_conflict", "Records changed during deletion. Refresh and try again.");
+    await this.runTransactionalBatch([
+      this.guardOperation(guard, {
+        ...(root ? { deletingRoots: [...new Set([...(guard?.deletingRoots ?? []), root.id])] } : { purging: true }),
+        pendingBlobDeletes: [...new Map([...(guard?.pendingBlobDeletes ?? []), ...blobs].map((entry) => [entry.documentId, entry])).values()],
+      }),
+      ...(root ? [{ operationType: BulkOperationType.Replace, id: root.id, resourceBody: { ...root, deleting: true } as any, ifMatch: root._etag } satisfies OperationInput] : []),
+    ], async () => { throw new StoreError(409, "version_conflict", "Records changed during deletion. Refresh and try again."); });
+    const selected = records.filter((record) => record.id !== mutationGuardId && record.id !== root?.id);
+    if (root) selected.push(await this.get(root.kind, root.id));
+    for (let index = 0; index < selected.length; index += 100) {
+      await this.runTransactionalBatch(selected.slice(index, index + 100).map(conditionalDelete), async () => { throw new StoreError(409, "version_conflict", "A record changed during deletion. Refresh and try again."); });
     }
   }
 }
 
 const stores = new Map<string, RecordStore>();
 export function getStore(organizationId = "test-organization"): RecordStore {
+  assertProductionConfiguration();
   let store = stores.get(organizationId);
   if (!store) {
     store = process.env.DATA_BACKEND === "memory"

@@ -50,7 +50,16 @@ async function sas(blobName: string, permissions: string, responseHeaders: { con
     : generateBlobSASQueryParameters(options, await client.getUserDelegationKey(startsOn, expiresOn), account).toString();
   return { url: `${client.url}/${process.env.STORAGE_CONTAINER ?? 'documents'}/${blobName}?${query}`, expiresAt: expiresOn.toISOString() };
 }
-export const uploadSas = (blobName: string, mimeType: string) => sas(blobName, 'cw', { contentType: mimeType });
+export async function uploadBlob(blobName: string, mimeType: string, content: Buffer) {
+  if (!content.length || content.length > maxFileSize) throw new StoreError(413, 'upload_too_large', 'Use a file of at most 25 MiB.');
+  const container = service().client.getContainerClient(process.env.STORAGE_CONTAINER ?? 'documents');
+  if (process.env.STORAGE_BLOB_ENDPOINT) await container.createIfNotExists();
+  await container.getBlockBlobClient(blobName).uploadData(content, {
+    conditions: { ifNoneMatch: '*' },
+    blobHTTPHeaders: { blobContentType: mimeType, blobCacheControl: 'private, no-store' },
+    abortSignal: AbortSignal.timeout(30_000),
+  });
+}
 export const downloadSas = (blobName: string, fileName: string, mimeType: string) => sas(blobName, 'r', {
   contentType: mimeType,
   contentDisposition: `attachment; filename="${safeName(fileName) || 'document'}"`,
@@ -63,12 +72,15 @@ export const viewSas = (blobName: string, mimeType: string) => sas(blobName, 'r'
 });
 export async function blobProperties(blobName: string) { try { return await service().client.getContainerClient(process.env.STORAGE_CONTAINER ?? 'documents').getBlobClient(blobName).getProperties(); } catch (error: any) { if (error.statusCode === 404) throw new StoreError(400, 'upload_missing', 'The uploaded blob could not be found.'); throw error; } }
 export async function deleteBlob(blobName: string) { return service().client.getContainerClient(process.env.STORAGE_CONTAINER ?? 'documents').getBlobClient(blobName).deleteIfExists({ deleteSnapshots: 'include' }); }
-export async function downloadBlobBase64(blobName: string) {
-  return (await downloadBlobBuffer(blobName)).toString('base64');
+export async function downloadBlobBase64(blobName: string, maxBytes = maxFileSize) {
+  return (await downloadBlobBuffer(blobName, maxBytes)).toString('base64');
 }
-export async function downloadBlobBuffer(blobName: string) {
-  return service().client
+export async function downloadBlobBuffer(blobName: string, maxBytes = maxFileSize) {
+  const blob = service().client
     .getContainerClient(process.env.STORAGE_CONTAINER ?? 'documents')
-    .getBlobClient(blobName)
-    .downloadToBuffer();
+    .getBlobClient(blobName);
+  const properties = await blob.getProperties();
+  if (!properties.contentLength || properties.contentLength > Math.min(maxBytes, maxFileSize))
+    throw new StoreError(413, 'download_too_large', 'This file exceeds the permitted download size.');
+  return blob.downloadToBuffer(0, properties.contentLength, { conditions: { ifMatch: properties.etag }, abortSignal: AbortSignal.timeout(30_000) });
 }

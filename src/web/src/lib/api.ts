@@ -127,20 +127,6 @@ export const api = {
         headers: record._etag ? { "if-match": record._etag } : {},
       },
     ),
-  uploadUrl: (data: Record<string, unknown>) =>
-    request<{
-      documentId: string;
-      blobName: string;
-      propertyId: string;
-      tenantId: string;
-      url: string;
-      expiresAt: string;
-    }>("/documents/upload-url", { method: "POST", body: JSON.stringify(data) }),
-  completeUpload: (data: Record<string, unknown>) =>
-    request<PortfolioRecord>("/documents/complete", {
-      method: "POST",
-      body: JSON.stringify(data),
-    }),
   downloadUrl: (id: string) =>
     request<{ url: string; expiresAt: string }>(
       `/documents/${id}/download-url`,
@@ -161,21 +147,13 @@ export const api = {
       mimeType: file.type,
       size: file.size,
     };
-    const target = await api.uploadUrl(metadata);
-    const response = await fetch(target.url, {
-      method: "PUT",
+    return request<PortfolioRecord>("/documents/upload", {
+      method: "POST",
       headers: {
-        "x-ms-blob-type": "BlockBlob",
         "content-type": file.type,
+        "x-document-metadata": encodeURIComponent(JSON.stringify(metadata)),
       },
       body: file,
-    });
-    if (!response.ok)
-      throw new ApiError("The file could not be uploaded securely.", response.status);
-    return api.completeUpload({
-      ...metadata,
-      documentId: target.documentId,
-      blobName: target.blobName,
     });
   },
   startRentalYear: (

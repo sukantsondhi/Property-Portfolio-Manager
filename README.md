@@ -78,9 +78,9 @@ Track certificates, cover and renewal dates with provider and reference details.
 
 ### Finance and documents
 
-The property Finance tab records costs such as mortgage, maintenance, utilities, insurance, tax, management and furnishing. The Documents tab organises files by property, tenant, rental year and category, while an expense can reference supporting document metadata. Upload and read access use short-lived, least-privilege URLs; Blob storage stays private and durable signed URLs are never stored in records.
+The property Finance tab records costs such as mortgage, maintenance, utilities, insurance, tax, management and furnishing. The Documents tab organises files by property, tenant, rental year and category, while an expense can reference supporting document metadata. Uploads pass through the authorised API with bounded bodies and create-only storage writes; downloads use short-lived read-only URLs. Blob storage stays private and durable signed URLs are never stored in records.
 
-Files are limited to 25 MiB and checked against their declared size, MIME type, extension and format signature. This is defence in depth, **not malware scanning**; operators should assess that limitation before accepting files from people they do not trust.
+Files are limited to 25 MiB and checked against their declared size, MIME type, extension and format signature before storage. Quotas limit each organisation to 5 GiB and 5,000 document records, with three outstanding uploads per user. These limits are **not a subscription spending cap or malware scanning**; operators should assess those limitations before accepting files from people they do not trust.
 
 ## Portfolio reporting
 

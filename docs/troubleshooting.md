@@ -46,7 +46,7 @@ The Bicep adds a **CanNotDelete** resource-group lock to prevent accidental dele
 
 ## Document upload or download fails
 
-Check `DOCUMENT_UPLOADS_ENABLED`, file type and 25 MiB limit, organisation membership, property/year state, private Blob container and Storage CORS origins. An archived document cannot be downloaded until restored. A signed read URL expires after ten minutes; request a new one. Never paste a signed URL or account key into a public issue.
+Check `DOCUMENT_UPLOADS_ENABLED`, file type and 25 MiB limit, organisation membership, property/year state and available document quota. Uploads now pass through the API, not Storage CORS. A 410 response from the old upload routes requires a browser refresh after the API and web deployment. A timed-out or failed upload can leave an archived reservation; ask an owner to remove it after two minutes. Accepted archived documents may be restored, but failed upload reservations cannot. A signed read URL expires after ten minutes; request a new one. Never paste a signed URL or account key into a public issue.
 
 ## Static Web App deployment token is rejected
 

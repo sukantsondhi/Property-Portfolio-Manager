@@ -42,7 +42,7 @@ Rent emails go to active organisation members on the property collection day, we
 
 ## Private pictures and documents
 
-Use **Documents** or a property/compliance upload control to add PDF, JPG, PNG, WebP, DOCX or XLSX files up to **25 MiB**. The API gives the browser a short-lived upload URL, checks size, MIME, extension and file signature, then creates the record. The Blob container is private. Open or download requires a fresh authorised short-lived URL. Do not forward links or upload untrusted files; this deployment has no malware scanner.
+Use **Documents** or a property/compliance upload control to add PDF, JPG, PNG, WebP, DOCX or XLSX files up to **25 MiB**. The authorised API receives and validates the file before writing private storage; the browser never receives storage write credentials. Each organisation has a 5 GiB/5,000-document limit, and each user may have three outstanding uploads at once. Open or download requires a fresh authorised short-lived read URL. Do not forward links or upload untrusted files; this deployment has no malware scanner.
 
 ## Rental years and History
 

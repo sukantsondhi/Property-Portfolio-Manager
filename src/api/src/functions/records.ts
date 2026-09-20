@@ -140,7 +140,10 @@ app.http("recordItem", {
           etag,
         );
         const blobResults = await Promise.allSettled(
-          result.blobNames.map((blobName) => deleteBlob(blobName)),
+          result.blobNames.map(async (blobName) => {
+            await deleteBlob(blobName);
+            await store.acknowledgeBlobDeletion(blobName);
+          }),
         );
         const blobCleanupFailures = blobResults.filter(
           (result) => result.status === "rejected",

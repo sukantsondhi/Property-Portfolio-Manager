@@ -33,6 +33,9 @@ if ($existingFreeAccounts.Count -gt 0) {
 
 $environmentName = Read-Required 'New azd environment name (for example, production)' '^[a-z][a-z0-9-]{1,19}$'
 $resourceGroup = Read-Required 'New Azure resource group name (for example, PropertyPortfolio)' '^[A-Za-z0-9][A-Za-z0-9._()-]{2,89}$'
+$groupExists = (az group exists --name $resourceGroup --subscription $subscriptionId --output tsv | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $groupExists -notin @('true', 'false')) { throw 'Could not verify that the resource group is new. Stop and check subscription access.' }
+if ($groupExists -eq 'true') { throw 'This resource group already exists. Choose a new name; this setup must not update an existing deployment.' }
 $region = Read-Required 'Azure data region (for example, uksouth)' '^[a-z0-9]+$'
 $webRegion = Read-Required 'Static Web Apps region (for example, westeurope)' '^[a-z0-9]+$'
 $websiteHostname = Read-Required 'Website hostname you control (for example, portfolio.example.com)' '^(?=.{4,253}$)[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$'
@@ -60,7 +63,8 @@ foreach ($entry in $settings.GetEnumerator()) {
 }
 
 $randomBytes = [byte[]]::new(48)
-[System.Security.Cryptography.RandomNumberGenerator]::Fill($randomBytes)
+$generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try { $generator.GetBytes($randomBytes) } finally { $generator.Dispose() }
 $reminderKey = [Convert]::ToBase64String($randomBytes)
 azd env set REMINDER_API_KEY $reminderKey | Out-Null
 $reminderKey = $null

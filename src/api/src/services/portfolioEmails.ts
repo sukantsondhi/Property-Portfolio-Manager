@@ -50,7 +50,7 @@ export function rentalYearBackupEmail(input: {
   const income = payments.reduce((sum, record) => sum + Number(record.amountPaidPence || 0), 0);
   const costs = expenses.reduce((sum, record) => sum + Number(record.amountPence || 0), 0);
   const link = secureHistoryUrl(organizationId, property.id, year.id);
-  const intro = "This backup is organised by record type. Money is shown in pounds, dates use the saved rental-year records, and each document is listed even when it is too large to attach. The secure history link requires the recipient to sign in with an authorised Microsoft account and retain Owner or Super admin access.";
+  const intro = "This backup is organised by record type. Money is shown in pounds, dates use the saved rental-year records, and each document is listed even when it is too large to attach. The secure history link requires the recipient to sign in with an authorised Microsoft account and retain access to the organisation.";
   const orderedKinds = ["property", "rentalYear", "tenant", "guarantor", "reference", "tenancy", "rentPayment", "expense", "compliance", "document"];
   const plainSections = orderedKinds.map((kind) => {
     const items = groups.get(kind) ?? [];

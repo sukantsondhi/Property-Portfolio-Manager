@@ -80,8 +80,12 @@ export async function deleteOrganization(request: HttpRequest, blobDeleter: (blo
     const input = organizationDeletionInput.parse(await request.json());
     const identity = authenticateIdentity(request);
     const result = await getDirectory().deleteOrganization(request.params.id, input.confirmationName, identity, async () => {
-      const purged = await getStore(request.params.id).purgeAll();
-      const blobResults = await Promise.allSettled(purged.blobNames.map((blobName) => blobDeleter(blobName)));
+      const store = getStore(request.params.id);
+      const purged = await store.purgeAll();
+      const blobResults = await Promise.allSettled(purged.blobNames.map(async (blobName) => {
+        await blobDeleter(blobName);
+        await store.acknowledgeBlobDeletion(blobName);
+      }));
       return {
         deletedRecordCount: purged.deletedCount,
         deletedBlobCount: blobResults.filter((item) => item.status === "fulfilled").length,

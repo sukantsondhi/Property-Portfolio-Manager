@@ -1,4 +1,4 @@
-import { app } from "@azure/functions";
+import { app, type HttpRequest } from "@azure/functions";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { validateRecord } from "../domain/schemas";
@@ -7,13 +7,11 @@ import { authorizeOrganization } from "../services/auth";
 import {
   allowedMimeTypes,
   assertFileSignature,
-  blobProperties,
   buildBlobName,
   deleteBlob,
-  downloadBlobBuffer,
   downloadSas,
   maxFileSize,
-  uploadSas,
+  uploadBlob,
   viewSas,
 } from "../services/blobs";
 import { json, problem, StoreError } from "../services/responses";
@@ -85,108 +83,79 @@ export async function resolveDocumentTarget(store: RecordStore, input: UploadInp
   return { propertyId, tenantId: input.tenantId || "", ...(rentalYearId ? { rentalYearId } : {}) };
 }
 
-app.http("documentUploadUrl", {
-  methods: ["POST"],
-  authLevel: "anonymous",
-  route: "documents/upload-url",
-  handler: async (request) => {
-    try {
-      const user = await authorizeOrganization(request);
-      if (process.env.DOCUMENT_UPLOADS_ENABLED !== "true") throw new StoreError(503, "uploads_disabled", "Document uploads are disabled by the administrator.");
-      const input = uploadRequest.parse(await request.json());
-      if (!allowedMimeTypes.has(input.mimeType))
-        throw new StoreError(
-          400,
-          "unsupported_file",
-          "Use PDF, JPG, PNG, WebP, DOCX, or XLSX files.",
-        );
-      const target = await resolveDocumentTarget(getStore(user.organizationId), input);
-      const documentId = randomUUID();
-      const blobName = buildBlobName(
-        documentId,
-        target.propertyId,
-        input.category,
-        input.fileName,
-        user.organizationId,
-      );
-      return json(200, {
-        documentId,
-        blobName,
-        ...target,
-        ...(await uploadSas(blobName, input.mimeType)),
-      });
-    } catch (error) {
-      return problem(error);
-    }
-  },
-});
-
-app.http("documentComplete", {
-  methods: ["POST"],
-  authLevel: "anonymous",
-  route: "documents/complete",
-  handler: async (request) => {
-    try {
-      const user = await authorizeOrganization(request);
-      if (process.env.DOCUMENT_UPLOADS_ENABLED !== "true") throw new StoreError(503, "uploads_disabled", "Document uploads are disabled by the administrator.");
-      const input = uploadRequest
-        .extend({ documentId: z.string().uuid(), blobName: z.string().min(1) })
-        .parse(await request.json());
-      const target = await resolveDocumentTarget(getStore(user.organizationId), input);
-      const expectedBlobName = buildBlobName(
-        input.documentId,
-        target.propertyId,
-        input.category,
-        input.fileName,
-        user.organizationId,
-      );
-      if (input.blobName !== expectedBlobName)
-        throw new StoreError(
-          400,
-          "invalid_blob_name",
-          "The uploaded document key is invalid.",
-        );
-      const properties = await blobProperties(input.blobName);
-      try {
-        if (
-          !properties.contentLength ||
-          properties.contentLength > maxFileSize ||
-          properties.contentLength !== input.size
-        )
-          throw new StoreError(
-            400,
-            "invalid_upload",
-            "The uploaded file size does not match the request.",
-          );
-        if (!allowedMimeTypes.has(properties.contentType ?? ""))
-          throw new StoreError(
-            400,
-            "unsupported_file",
-            "The uploaded file type is not allowed.",
-          );
-        if (properties.contentType !== input.mimeType)
-          throw new StoreError(
-            400,
-            "mime_type_mismatch",
-            "The uploaded file type does not match the request.",
-          );
-        assertFileSignature(input.fileName, input.mimeType, await downloadBlobBuffer(input.blobName));
-      } catch (error) {
-        await deleteBlob(input.blobName).catch(() => undefined);
-        throw error;
+export async function readUploadBody(body: HttpRequest["body"], size: number) {
+  if (!body || !Number.isInteger(size) || size < 1 || size > maxFileSize)
+    throw new StoreError(400, "invalid_upload", "A file of at most 25 MiB is required.");
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let length = 0;
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => undefined); }, 30_000);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (timedOut) throw new StoreError(408, "upload_timeout", "The upload took too long. Try again.");
+      if (done) break;
+      length += value.byteLength;
+      if (length > size || length > maxFileSize) {
+        await reader.cancel().catch(() => undefined);
+        throw new StoreError(413, "upload_too_large", "The uploaded file exceeds its declared size or the 25 MiB limit.");
       }
-      const record = validateRecord("document", {
-        ...input,
-        ...target,
-        blobName: expectedBlobName,
-        size: properties.contentLength,
-      });
-      return json(201, await getStore(user.organizationId).create("document", record, user));
-    } catch (error) {
-      return problem(error);
+      chunks.push(Buffer.from(value));
     }
-  },
-});
+    if (length !== size) throw new StoreError(400, "invalid_upload", "The uploaded file size does not match the request.");
+    return Buffer.concat(chunks, length);
+  } finally {
+    clearTimeout(timeout);
+    reader.releaseLock();
+  }
+}
+
+export async function uploadDocument(request: HttpRequest) {
+  try {
+    const user = await authorizeOrganization(request);
+    if (process.env.DOCUMENT_UPLOADS_ENABLED !== "true") throw new StoreError(503, "uploads_disabled", "Document uploads are disabled by the administrator.");
+    let metadata: unknown;
+    try {
+      const encoded = request.headers.get("x-document-metadata") ?? "";
+      if (encoded.length > 8192) throw new Error("metadata_limit");
+      metadata = JSON.parse(decodeURIComponent(encoded));
+    } catch { throw new StoreError(400, "invalid_upload_metadata", "Valid document metadata is required."); }
+    const input = uploadRequest.parse(metadata);
+    if (!allowedMimeTypes.has(input.mimeType) || request.headers.get("content-type") !== input.mimeType)
+      throw new StoreError(400, "unsupported_file", "Use PDF, JPG, PNG, WebP, DOCX, or XLSX files with a matching file type.");
+    const declaredLength = request.headers.get("content-length");
+    if (declaredLength && Number(declaredLength) !== input.size)
+      throw new StoreError(400, "invalid_upload", "The uploaded file size does not match the request.");
+    const store = getStore(user.organizationId);
+    const target = await resolveDocumentTarget(store, input);
+    const documentId = randomUUID();
+    const blobName = buildBlobName(documentId, target.propertyId, input.category, input.fileName, user.organizationId);
+    const reservation = await store.reserveDocumentUpload(documentId, validateRecord("document", { ...input, ...target, blobName }), user);
+    try {
+      const content = await readUploadBody(request.body, input.size);
+      assertFileSignature(input.fileName, input.mimeType, content);
+      await authorizeOrganization(request);
+      await uploadBlob(blobName, input.mimeType, content);
+      const authorized = await authorizeOrganization(request);
+      return json(201, await store.completeDocumentUpload(reservation, authorized));
+    } catch (error) {
+      await store.abandonDocumentUpload(reservation, user, deleteBlob).catch(() => undefined);
+      throw error;
+    }
+  } catch (error) { return problem(error); }
+}
+
+export async function retiredDocumentUpload(request: HttpRequest) {
+  try {
+    await authorizeOrganization(request);
+    throw new StoreError(410, "upload_workflow_changed", "Refresh the application before uploading documents.");
+  } catch (error) { return problem(error); }
+}
+
+app.http("documentUpload", { methods: ["POST"], authLevel: "anonymous", route: "documents/upload", handler: uploadDocument });
+app.http("documentUploadUrl", { methods: ["POST"], authLevel: "anonymous", route: "documents/upload-url", handler: retiredDocumentUpload });
+app.http("documentComplete", { methods: ["POST"], authLevel: "anonymous", route: "documents/complete", handler: retiredDocumentUpload });
 
 app.http("documentDownload", {
   methods: ["POST"],
